@@ -8,6 +8,11 @@ ENV/
 .env
 *.env.local
 
+# Local job history database
+data/*.db
+data/*.db-journal
+data/processed_jobs.json
+
 # Output files & generated documents
 output/
 *.pdf

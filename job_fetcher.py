@@ -27,13 +27,14 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+from job_store import JobHistoryManager, fingerprint_of  # noqa: E402  (re-exported for main.py)
+
 # Ensure UTF-8 output on Windows console to avoid charmap errors with currencies (₹, €, etc.)
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PROCESSED_JOBS_FILE = Path("data/processed_jobs.json")
 REQUEST_TIMEOUT = 15
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qaJobHunterBot/1.0"
 
@@ -254,58 +255,6 @@ class JobOpportunity:
 
 
 
-class JobHistoryManager:
-    """Manages tracking of evaluated jobs to prevent reprocessing and duplicate alerts."""
-
-    def __init__(self, history_file: Path | str = PROCESSED_JOBS_FILE) -> None:
-        self.history_file = Path(history_file)
-        self.history_file.parent.mkdir(parents=True, exist_ok=True)
-        self.processed_ids: dict[str, dict[str, Any]] = self._load()
-
-    def _load(self) -> dict[str, dict[str, Any]]:
-        if not self.history_file.exists():
-            return {}
-        try:
-            with open(self.history_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as exc:
-            print(f"[WARN] No se pudo leer {self.history_file}: {exc}. Reiniciando historial en memoria.")
-            return {}
-
-    def save(self) -> None:
-        try:
-            with open(self.history_file, "w", encoding="utf-8") as f:
-                json.dump(self.processed_ids, f, indent=2, ensure_ascii=False)
-        except Exception as exc:
-            print(f"[ERROR] Error al guardar historial en {self.history_file}: {exc}", file=sys.stderr)
-
-    def is_processed(self, job_id: str) -> bool:
-        return job_id in self.processed_ids
-
-    def mark_processed(
-        self,
-        job: JobOpportunity,
-        is_viable: bool,
-        match_score: int = 0,
-        notes: str = "",
-    ) -> None:
-        now_str = datetime.now(timezone.utc).isoformat()
-        self.processed_ids[job.id] = {
-            "title": job.title,
-            "company": job.company,
-            "url": job.url,
-            "source": job.source,
-            "job_type": job.job_type,
-            "location": job.location,
-            "is_india": job.is_india,
-            "is_viable": is_viable,
-            "match_score": match_score,
-            "notes": notes,
-            "processed_at": now_str,
-        }
-        self.save()
-
-
 def _generate_job_id(url: str, title: str) -> str:
     """Generates a stable unique hash identifier for a job post."""
     key = f"{url.strip().lower()}|{title.strip().lower()}"
@@ -471,7 +420,7 @@ def fetch_arbeitnow_jobs() -> list[JobOpportunity]:
                     continue
 
                 is_india = detect_india_region(f"{title} {location} {desc_clean}")
-                job_id = f"arbeitnow_{item.get('slug', '')}" or _generate_job_id(url, title)
+                job_id = f"arbeitnow_{item['slug']}" if item.get("slug") else _generate_job_id(url, title)
 
                 jobs.append(
                     JobOpportunity(
@@ -1071,11 +1020,13 @@ def fetch_all_new_qa_jobs(
         if not allow_india and job.is_india:
             continue
 
-        if job.id in seen_in_run:
+        fp = fingerprint_of(job)
+        if job.id in seen_in_run or fp in seen_in_run:
             continue
         seen_in_run.add(job.id)
+        seen_in_run.add(fp)
 
-        if history.is_processed(job.id):
+        if history.is_known(job):
             continue
 
         new_jobs.append(job)

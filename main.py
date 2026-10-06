@@ -338,7 +338,26 @@ if __name__ == "__main__":
         help="Fuentes específicas separadas por coma (ej: freelancer,remotive,jobicy,remoteok,hasjob).",
     )
 
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Mostrar estadisticas del historial (SQLite) y salir.",
+    )
+    parser.add_argument(
+        "--reevaluate-legacy",
+        action="store_true",
+        help="Olvidar los registros migrados del JSON antiguo para volver a evaluarlos con el pipeline actual.",
+    )
+
     args = parser.parse_args()
+
+    if args.stats or args.reevaluate_legacy:
+        with JobHistoryManager() as history:
+            if args.reevaluate_legacy:
+                removed = history.forget_legacy()
+                print(f"[*] {removed} registros legacy eliminados; se volveran a evaluar en la proxima busqueda.")
+            print(f"[*] Historial: {history.stats()}")
+        sys.exit(0)
 
 
     selected_sources = [s.strip() for s in args.sources.split(",") if s.strip()] or None
