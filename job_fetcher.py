@@ -16,11 +16,14 @@ import json
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -899,6 +902,129 @@ def fetch_custom_rss(feed_url: str, source_name: str = "CustomFeed") -> list[Job
     return jobs
 
 
+# ---------------------------------------------------------------------------
+# Source registry
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class JobSource:
+    """
+    A pluggable job source.
+
+    name:              key used in ENABLED_SOURCES / --sources.
+    fetch:             callable(limit) -> list[JobOpportunity]. It must catch its own network errors.
+    freelance_platform: True for 100% freelance marketplaces (kept when --freelance-only is used).
+    india_only:        True for boards that only make sense when ALLOW_INDIA_JOBS is enabled.
+    label:             human-readable name for logs.
+    """
+
+    name: str
+    fetch: Callable[[int], list[JobOpportunity]]
+    freelance_platform: bool = False
+    india_only: bool = False
+    label: str = ""
+
+
+SOURCE_REGISTRY: dict[str, JobSource] = {}
+
+
+def register_source(source: JobSource) -> JobSource:
+    """Registers (or replaces) a job source. Add new sources without touching the aggregator."""
+    SOURCE_REGISTRY[source.name.lower()] = source
+    return source
+
+
+register_source(JobSource("freelancer", lambda n: fetch_freelancer_jobs(limit=n), freelance_platform=True, label="Freelancer.com"))
+register_source(JobSource("remotive", lambda n: fetch_remotive_jobs(search_query="qa"), label="Remotive"))
+register_source(JobSource("jobicy", lambda n: fetch_jobicy_jobs(limit=n), label="Jobicy"))
+register_source(JobSource("remoteok", lambda n: fetch_remoteok_jobs(limit=n), label="RemoteOK"))
+register_source(JobSource("himalayas", lambda n: fetch_himalayas_jobs(limit=n), label="Himalayas"))
+register_source(JobSource("weworkremotely", lambda n: fetch_weworkremotely_jobs(), label="We Work Remotely"))
+register_source(JobSource("hasjob", lambda n: fetch_hasjob_jobs(limit=n), india_only=True, label="Hasjob (India)"))
+register_source(JobSource("arbeitnow", lambda n: fetch_arbeitnow_jobs(), label="Arbeitnow"))
+
+DEFAULT_ENABLED_SOURCES = "freelancer,remotive,jobicy,remoteok,himalayas,weworkremotely,arbeitnow"
+SOURCE_TIMEOUT_SECONDS = int(os.getenv("SOURCE_TIMEOUT_SECONDS", "60"))
+FETCH_WORKERS = int(os.getenv("FETCH_WORKERS", "6"))
+
+
+def _custom_feed_sources() -> list[JobSource]:
+    """Builds one JobSource per URL in CUSTOM_JOB_FEEDS (comma separated RSS/Atom feeds)."""
+    sources: list[JobSource] = []
+    raw = os.getenv("CUSTOM_JOB_FEEDS", "").strip()
+    for idx, feed in enumerate([f.strip() for f in raw.split(",") if f.strip()], start=1):
+        sources.append(
+            JobSource(
+                name=f"feed_{idx}",
+                fetch=lambda n, feed=feed, idx=idx: fetch_custom_rss(feed, source_name=f"Feed_{idx}"),
+                label=f"Feed #{idx} ({feed[:40]})",
+            )
+        )
+    return sources
+
+
+def _resolve_sources(
+    requested: Optional[list[str]],
+    allow_india: bool,
+    freelance_only: bool,
+) -> list[JobSource]:
+    """Turns requested names (or .env defaults) into the list of sources to run, in a stable order."""
+    names = [s.strip().lower() for s in (requested or os.getenv("ENABLED_SOURCES", DEFAULT_ENABLED_SOURCES).split(",")) if s.strip()]
+
+    selected: list[JobSource] = []
+    for name in names:
+        source = SOURCE_REGISTRY.get(name)
+        if source is None:
+            print(f"[WARN] Fuente desconocida '{name}'. Disponibles: {', '.join(sorted(SOURCE_REGISTRY))}", file=sys.stderr)
+            continue
+        if freelance_only and not source.freelance_platform:
+            continue
+        if source.india_only and not allow_india:
+            continue
+        if source not in selected:
+            selected.append(source)
+
+    selected.extend(_custom_feed_sources())
+    return selected
+
+
+def _run_source(source: JobSource, limit: int) -> tuple[list[JobOpportunity], float]:
+    started = time.monotonic()
+    jobs = source.fetch(limit) or []
+    return jobs[:limit], time.monotonic() - started
+
+
+def fetch_from_sources(selected: list[JobSource], limit_per_source: int) -> list[JobOpportunity]:
+    """
+    Runs the selected sources concurrently (I/O bound). A failing or slow source never blocks or
+    breaks the others. Results are returned in registry order for deterministic output.
+    """
+    if not selected:
+        return []
+
+    results: dict[str, list[JobOpportunity]] = {}
+    executor = ThreadPoolExecutor(max_workers=max(1, min(FETCH_WORKERS, len(selected))))
+    futures = {executor.submit(_run_source, src, limit_per_source): src for src in selected}
+    try:
+        for future, src in futures.items():
+            label = src.label or src.name
+            try:
+                jobs, elapsed = future.result(timeout=SOURCE_TIMEOUT_SECONDS)
+                results[src.name] = jobs
+                print(f"    [{label}] {len(jobs)} ofertas QA pre-filtradas ({elapsed:.1f}s)")
+            except FutureTimeout:
+                print(f"    [{label}] [WARN] timeout tras {SOURCE_TIMEOUT_SECONDS}s, se omite.", file=sys.stderr)
+            except Exception as exc:
+                print(f"    [{label}] [WARN] fallo la fuente: {exc}", file=sys.stderr)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    ordered: list[JobOpportunity] = []
+    for src in selected:
+        ordered.extend(results.get(src.name, []))
+    return ordered
+
+
 def fetch_all_new_qa_jobs(
     history_manager: Optional[JobHistoryManager] = None,
     limit_per_source: int = 15,
@@ -908,116 +1034,33 @@ def fetch_all_new_qa_jobs(
     india_only: bool = False,
 ) -> list[JobOpportunity]:
     """
-    Main aggregator: fetches QA jobs across all supported platforms:
-    - Freelancer.com (proyectos freelance y pagos por proyecto)
-    - Remotive API (ofertas remotas globales)
-    - We Work Remotely RSS (ofertas remotas seleccionadas)
-    - Jobicy API (remoto global y APAC)
-    - RemoteOK API (remoto tech)
-    - Himalayas API (remoto global)
-    - Hasjob (India startup tech board)
-    - Feeds personalizados (RSS / Atom)
-    Deduplicates against history, applies filters, and returns only new, unhandled opportunities.
+    Main aggregator: fetches QA jobs concurrently from every enabled source in SOURCE_REGISTRY
+    (plus CUSTOM_JOB_FEEDS), applies region/freelance filters and returns only NEW opportunities
+    (not in history, deduplicated by id and by cross-source fingerprint).
     """
     history = history_manager or JobHistoryManager()
-    all_jobs: list[JobOpportunity] = []
     seen_in_run: set[str] = set()
 
-    # Determine enabled sources from parameter or .env
-    env_sources_str = os.getenv(
-        "ENABLED_SOURCES",
-        "freelancer,remotive,jobicy,remoteok,himalayas,weworkremotely,hasjob,arbeitnow",
-    ).strip().lower()
-    enabled_sources = [s.strip() for s in (sources or env_sources_str.split(",")) if s.strip()]
-
     if allow_india is None:
-        allow_india = os.getenv("ALLOW_INDIA_JOBS", "true").strip().lower() in ("true", "1", "yes")
+        allow_india = os.getenv("ALLOW_INDIA_JOBS", "false").strip().lower() in ("true", "1", "yes")
+
+    selected = _resolve_sources(sources, allow_india=allow_india or india_only, freelance_only=freelance_only)
 
     print("\n" + "=" * 65)
     print(">> INICIANDO AGREGADOR DE OFERTAS QA EN VIVO")
-    print(f"   Fuentes activas: {', '.join(enabled_sources)}")
+    print(f"   Fuentes activas: {', '.join(s.name for s in selected) or '(ninguna)'}")
     print(f"   Filtros: freelance_only={freelance_only} | india_only={india_only} | allow_india={allow_india}")
     print("=" * 65)
 
-    # 1. Freelancer.com (100% freelance, per-project fixed price & hourly)
-    if "freelancer" in enabled_sources:
-        print("[*] Buscando proyectos freelance en Freelancer.com API...")
-        fl_jobs = fetch_freelancer_jobs(limit=limit_per_source)
-        print(f"    -> {len(fl_jobs)} proyectos freelance QA encontrados.")
-        all_jobs.extend(fl_jobs)
+    all_jobs = fetch_from_sources(selected, limit_per_source)
 
-    # 2. Remotive API
-    if "remotive" in enabled_sources and not freelance_only:
-        print("[*] Buscando ofertas QA en Remotive API...")
-        remotive = fetch_remotive_jobs(search_query="qa")
-        print(f"    -> {len(remotive)} ofertas QA pre-filtradas en Remotive.")
-        all_jobs.extend(remotive[:limit_per_source])
-
-    # 3. Jobicy API
-    if "jobicy" in enabled_sources and not freelance_only:
-        print("[*] Buscando ofertas QA en Jobicy API (Global & APAC)...")
-        jobicy = fetch_jobicy_jobs(limit=limit_per_source)
-        print(f"    -> {len(jobicy)} ofertas QA pre-filtradas en Jobicy.")
-        all_jobs.extend(jobicy[:limit_per_source])
-
-    # 4. RemoteOK API
-    if "remoteok" in enabled_sources and not freelance_only:
-        print("[*] Buscando ofertas QA en RemoteOK API...")
-        remoteok = fetch_remoteok_jobs(limit=limit_per_source)
-        print(f"    -> {len(remoteok)} ofertas QA pre-filtradas en RemoteOK.")
-        all_jobs.extend(remoteok[:limit_per_source])
-
-    # 5. Himalayas API
-    if "himalayas" in enabled_sources and not freelance_only:
-        print("[*] Buscando ofertas QA en Himalayas API...")
-        himalayas = fetch_himalayas_jobs(limit=limit_per_source)
-        print(f"    -> {len(himalayas)} ofertas QA pre-filtradas en Himalayas.")
-        all_jobs.extend(himalayas[:limit_per_source])
-
-    # 6. We Work Remotely RSS
-    if "weworkremotely" in enabled_sources and not freelance_only:
-        print("[*] Buscando ofertas QA en We Work Remotely RSS...")
-        wwr = fetch_weworkremotely_jobs()
-        print(f"    -> {len(wwr)} ofertas QA pre-filtradas en We Work Remotely.")
-        all_jobs.extend(wwr[:limit_per_source])
-
-    # 7. Hasjob (India Startup Tech Board)
-    if "hasjob" in enabled_sources and allow_india and not freelance_only:
-        print("[*] Buscando ofertas tech en Hasjob (India Atom Feed)...")
-        hasjob = fetch_hasjob_jobs(limit=limit_per_source)
-        print(f"    -> {len(hasjob)} ofertas QA pre-filtradas en Hasjob.")
-        all_jobs.extend(hasjob[:limit_per_source])
-
-    # 8. Arbeitnow API
-    if "arbeitnow" in enabled_sources and not freelance_only:
-        print("[*] Buscando ofertas QA en Arbeitnow API...")
-        arbeitnow = fetch_arbeitnow_jobs()
-        print(f"    -> {len(arbeitnow)} ofertas QA pre-filtradas en Arbeitnow.")
-        all_jobs.extend(arbeitnow[:limit_per_source])
-
-    # 9. Feeds personalizados configurados en .env (CUSTOM_JOB_FEEDS=url1,url2)
-    custom_feeds = os.getenv("CUSTOM_JOB_FEEDS", "").strip()
-    if custom_feeds:
-        for idx, feed in enumerate(custom_feeds.split(","), start=1):
-            feed = feed.strip()
-            if feed:
-                print(f"[*] Buscando en Feed personalizado #{idx}: {feed[:45]}...")
-                custom_jobs = fetch_custom_rss(feed, source_name=f"Feed_{idx}")
-                all_jobs.extend(custom_jobs[:limit_per_source])
-
-    # Filter and deduplicate against history and current run
     new_jobs: list[JobOpportunity] = []
     for job in all_jobs:
-        # Check freelance_only filter
         if freelance_only and "freelance" not in job.source.lower() and "fixed" not in job.job_type.lower():
             continue
-
-        # Check india_only filter
         if india_only and not job.is_india:
             continue
-
-        # Check allow_india filter
-        if not allow_india and job.is_india:
+        if not allow_india and not india_only and job.is_india:
             continue
 
         fp = fingerprint_of(job)
