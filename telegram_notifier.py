@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import ssl_setup  # noqa: F401  (trust the OS certificate store; must precede network imports)
 import requests
 from dotenv import load_dotenv
 

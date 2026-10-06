@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import ssl_setup  # noqa: F401  (trust the OS certificate store; must precede network imports)
 from dotenv import load_dotenv
 
 import gemini_evaluator

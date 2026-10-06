@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import ssl_setup  # noqa: F401  (trust the OS certificate store; must precede network imports)
 import requests
 from dotenv import load_dotenv
 
